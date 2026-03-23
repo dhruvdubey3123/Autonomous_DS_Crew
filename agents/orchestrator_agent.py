@@ -51,6 +51,25 @@ import re
 load_dotenv(override=True)
 
 
+# Ensure CrewAI writes its internal SQLite storage to a writable path
+# inside the project (sandbox-safe).
+def _configure_crewai_storage() -> None:
+    storage_dir = Path(os.getenv("CREWAI_STORAGE_PATH", "./_crewai_storage")).resolve()
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import crewai.utilities.paths as crew_paths
+        import crewai.memory.storage.kickoff_task_outputs_storage as kickoff_storage
+
+        def _db_storage_path() -> str:
+            return str(storage_dir)
+
+        crew_paths.db_storage_path = _db_storage_path
+        kickoff_storage.db_storage_path = _db_storage_path
+        logger.info(f"CrewAI storage path set to: {storage_dir}")
+    except Exception as e:
+        logger.warning(f"Could not override CrewAI storage path: {e}")
+
+
 # ── 1. Init LLM ─────────────────────────────────────────────
 
 def get_llm() -> LLM:
@@ -485,6 +504,9 @@ def run_pipeline(filepath: str, target_col: str) -> dict:
     logger.info(f"Target:   {target_col}")
     logger.info("=" * 60)
 
+    # Ensure CrewAI storage is writable before any Crew objects are created.
+    _configure_crewai_storage()
+
     # Create required directories
     for d in ["./data", "./models", "./reports",
               "./logs", "./chroma_db", "./mlruns"]:
@@ -597,6 +619,10 @@ def run_pipeline(filepath: str, target_col: str) -> dict:
             if not eda_payload:
                 eda_payload = json.loads(
                     run_exploratory_analysis.run(filepath=cleaned_path, target_col=target_col)
+                )
+            if not chart_payload:
+                chart_payload = json.loads(
+                    generate_visualisations.run(filepath=cleaned_path, target_col=target_col)
                 )
 
             report_data_json = compile_report_data.run(

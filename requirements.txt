@@ -61,4 +61,3 @@ litellm
 crewai[tools]
 groq
 openai~=1.83.0
-litellm[proxy]

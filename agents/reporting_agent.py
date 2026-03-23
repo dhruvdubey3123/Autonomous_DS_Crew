@@ -88,6 +88,140 @@ def _chart_title_from_path(path_value: str) -> str:
     return name.replace("_", " ").title()
 
 
+def _scan_report_charts(output_dir: Path) -> dict:
+    """Discover chart artifacts in reports/ when explicit chart paths are missing."""
+    def _latest(pattern: str) -> str | None:
+        matches = sorted(output_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        return str(matches[0]) if matches else None
+
+    charts = {
+        "distributions": [str(p) for p in sorted(output_dir.glob("dist_*.*"))],
+        "correlation_heatmap": _latest("correlation_heatmap.*"),
+        "missing_values": _latest("missing_values.*"),
+        "outliers": _latest("outliers_boxplot.*"),
+        "target_distribution": _latest("target_*.*"),
+        "pairplot": _latest("pairplot.*"),
+        "feature_importance": _latest("feature_importance.*"),
+        "model_comparison": _latest("model_comparison_*.*"),
+    }
+    # Drop empty lists/None
+    charts = {k: v for k, v in charts.items() if v}
+
+    # Include any remaining chart files not already captured
+    captured = set()
+    for v in charts.values():
+        if isinstance(v, list):
+            captured.update(str(p) for p in v)
+        else:
+            captured.add(str(v))
+
+    all_files = list(output_dir.glob("*.png")) + list(output_dir.glob("*.jpg")) + list(output_dir.glob("*.jpeg")) \
+        + list(output_dir.glob("*.svg")) + list(output_dir.glob("*.html"))
+    extras = []
+    for p in all_files:
+        name = p.name.lower()
+        if name.startswith("report_") or name.startswith("latest_report") or name.startswith("latest_charts"):
+            continue
+        if str(p) in captured:
+            continue
+        extras.append(str(p))
+    if extras:
+        charts["all_charts"] = extras
+    return charts
+
+
+def _infer_model_name(model) -> str:
+    """Return a readable model name even if it's a pipeline."""
+    try:
+        if hasattr(model, "named_steps") and "model" in model.named_steps:
+            return type(model.named_steps["model"]).__name__
+        return type(model).__name__
+    except Exception:
+        return "unknown"
+
+
+def _compute_basic_metrics(df: pd.DataFrame, target_col: str, model_path: str) -> tuple[dict, str, str]:
+    """Compute basic metrics from a saved model when LLM outputs are missing."""
+    try:
+        if not Path(model_path).exists() or target_col not in df.columns:
+            return {}, "unknown", "unknown"
+
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import (
+            accuracy_score, f1_score, precision_score, recall_score,
+            r2_score, mean_squared_error, mean_absolute_error,
+        )
+        from pipelines.automl_pipeline import detect_task_type
+        import pickle
+
+        with open(model_path, "rb") as f:
+            model = pickle.load(f)
+
+        X = df.drop(columns=[target_col])
+        y = df[target_col]
+        task_type = detect_task_type(y)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=0.2,
+            random_state=42,
+            stratify=y if task_type == "classification" else None,
+        )
+
+        y_pred = model.predict(X_test)
+
+        if task_type == "classification":
+            metrics = {
+                "accuracy": round(float(accuracy_score(y_test, y_pred)), 4),
+                "f1_macro": round(float(f1_score(y_test, y_pred, average="macro", zero_division=0)), 4),
+                "precision": round(float(precision_score(y_test, y_pred, average="macro", zero_division=0)), 4),
+                "recall": round(float(recall_score(y_test, y_pred, average="macro", zero_division=0)), 4),
+            }
+        else:
+            mse = mean_squared_error(y_test, y_pred)
+            metrics = {
+                "r2": round(float(r2_score(y_test, y_pred)), 4),
+                "rmse": round(float(mse ** 0.5), 4),
+                "mae": round(float(mean_absolute_error(y_test, y_pred)), 4),
+            }
+
+        return metrics, task_type, _infer_model_name(model)
+    except Exception:
+        return {}, "unknown", "unknown"
+
+
+def _compute_top_features(df: pd.DataFrame, target_col: str, model_path: str, top_n: int = 8) -> list[dict]:
+    """Compute top feature importances from a saved model when missing."""
+    try:
+        if not Path(model_path).exists() or target_col not in df.columns:
+            return []
+
+        from pipelines.automl_pipeline import get_feature_importances
+        import pickle
+
+        with open(model_path, "rb") as f:
+            model = pickle.load(f)
+
+        X = df.drop(columns=[target_col])
+        feat_names, feat_imports = get_feature_importances(model, X)
+        if not feat_names or not feat_imports:
+            return []
+
+        features = sorted(
+            zip(feat_names, feat_imports),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:top_n]
+
+        return [
+            {"feature": name, "importance": round(float(imp), 4)}
+            for name, imp in features
+        ]
+    except Exception:
+        return []
+
+
 def _build_chart_blocks(output_dir: Path, flat_charts: dict, chart_findings: Dict[str, str]) -> List[dict]:
     blocks = []
     for _, path in flat_charts.items():
@@ -160,6 +294,88 @@ def get_llm() -> LLM:
         temperature=0.3,
         max_tokens=int(os.getenv("GROQ_MAX_TOKENS", 512)),
     )
+
+
+def _coerce_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        parts = [p.strip(" -\t") for p in re.split(r"[\n;]+", value) if p.strip()]
+        return parts
+    return []
+
+
+def _llm_enrich_report(report_data: dict) -> dict:
+    """Generate narrative insights via LLM. Returns a dict of enrichment fields."""
+    if os.getenv("REPORT_USE_LLM", "true").lower() != "true":
+        return {}
+
+    try:
+        llm = get_llm()
+        context = {
+            "dataset_name": report_data.get("dataset_name"),
+            "rows": report_data.get("dataset_rows"),
+            "columns": report_data.get("dataset_cols"),
+            "target": report_data.get("target_col"),
+            "target_distribution": report_data.get("target_distribution"),
+            "missing_pct": report_data.get("missing_pct"),
+            "duplicate_rows": report_data.get("duplicate_rows"),
+            "task_type": report_data.get("task_type"),
+            "best_model": report_data.get("best_model_name"),
+            "metrics": report_data.get("best_metrics"),
+            "top_features": [f.get("feature") for f in report_data.get("top_features", []) if isinstance(f, dict)][:5],
+            "overfit": {
+                "train_score": report_data.get("train_score"),
+                "test_score": report_data.get("test_score"),
+                "gap_pct": report_data.get("gap_pct"),
+                "severity": report_data.get("severity"),
+            },
+            "key_findings": report_data.get("key_findings", []),
+            "recommendations": report_data.get("recommendations", []),
+        }
+
+        system = (
+            "You are a senior data science communicator. Use only the provided facts. "
+            "Be concise, concrete, and avoid speculation."
+        )
+        user = (
+            "Return exactly 6 lines, no extra text. Use this format:\n"
+            "SUMMARY: <one sentence>\n"
+            "INSIGHT: <short insight>\n"
+            "INSIGHT: <short insight>\n"
+            "RISK: <short risk>\n"
+            "NEXT: <short next step>\n"
+            "NEXT: <short next step>\n\n"
+            f"DATA:\n{json.dumps(context, ensure_ascii=False)}"
+        )
+
+        response = llm.call(messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ])
+
+        lines = [ln.strip() for ln in str(response).splitlines() if ln.strip()]
+        summary = [ln.split(":", 1)[1].strip() for ln in lines if ln.startswith("SUMMARY:")]
+        insights = [ln.split(":", 1)[1].strip() for ln in lines if ln.startswith("INSIGHT:")]
+        risks = [ln.split(":", 1)[1].strip() for ln in lines if ln.startswith("RISK:")]
+        next_steps = [ln.split(":", 1)[1].strip() for ln in lines if ln.startswith("NEXT:")]
+
+        executive_summary = _coerce_list(summary + insights)
+        if not (executive_summary or risks or next_steps):
+            return {}
+
+        return {
+            "executive_summary": executive_summary,
+            "insights_bullets": _coerce_list(insights) or executive_summary,
+            "insights_narrative": summary[0] if summary else "",
+            "risk_notes": _coerce_list(risks),
+            "next_steps": _coerce_list(next_steps),
+        }
+    except Exception as e:
+        logger.warning(f"LLM enrichment skipped: {e}")
+        return {}
 
 
 # â”€â”€ 2. HTML Template â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -296,6 +512,30 @@ HTML_TEMPLATE = """
 </header>
 
 <div class="container">
+
+    {% if executive_summary or insights_bullets %}
+    <div class="card">
+        <h2>Executive Summary</h2>
+        {% if executive_summary %}
+        <ul>
+        {% for item in executive_summary %}
+            <li>{{ item }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
+        {% if insights_narrative %}
+        <div class="narrative">{{ insights_narrative }}</div>
+        {% endif %}
+        {% if insights_bullets %}
+        <h3>Key Insights</h3>
+        <ul>
+        {% for item in insights_bullets %}
+            <li>{{ item }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
+    </div>
+    {% endif %}
 
     <!-- Terminology -->
     {% if terminology %}
@@ -480,6 +720,44 @@ HTML_TEMPLATE = """
         {% endif %}
     </div>
 
+    {% if risk_notes or opportunities or limitations or next_steps %}
+    <div class="card">
+        <h2>Risks, Opportunities, Next Steps</h2>
+        {% if risk_notes %}
+        <h3>Risks</h3>
+        <ul>
+        {% for item in risk_notes %}
+            <li>{{ item }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
+        {% if opportunities %}
+        <h3>Opportunities</h3>
+        <ul>
+        {% for item in opportunities %}
+            <li>{{ item }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
+        {% if limitations %}
+        <h3>Limitations</h3>
+        <ul>
+        {% for item in limitations %}
+            <li>{{ item }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
+        {% if next_steps %}
+        <h3>Next Steps</h3>
+        <ul>
+        {% for item in next_steps %}
+            <li>{{ item }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
+    </div>
+    {% endif %}
+
     {% if process_summary %}
     <div class="card">
         <h2>What DS Crew Did</h2>
@@ -537,6 +815,11 @@ def generate_html_report(report_data_json: str) -> str:
         data       = _safe_json_loads(report_data_json, default={})
         output_dir = Path(os.getenv("REPORTS_DIR", "./reports"))
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        if not data or data.get("dataset_rows") in (None, "", "N/A"):
+            fallback_path = output_dir / "latest_report_data.json"
+            if fallback_path.exists():
+                data = _safe_json_loads(fallback_path.read_text(encoding="utf-8"), default=data)
 
         timestamp    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         latest_path  = output_dir / "latest_report.html"
@@ -599,6 +882,12 @@ def generate_html_report(report_data_json: str) -> str:
             process_summary  = data.get("process_summary", []),
             terminology      = data.get("terminology", []),
             top_features     = top_features,
+            executive_summary= data.get("executive_summary", []),
+            insights_bullets = data.get("insights_bullets", []),
+            risk_notes       = data.get("risk_notes", []),
+            opportunities    = data.get("opportunities", []),
+            limitations      = data.get("limitations", []),
+            next_steps       = data.get("next_steps", []),
         )
         html = html.encode("ascii", "ignore").decode("ascii")
 
@@ -885,10 +1174,35 @@ def compile_report_data(
         eval_data = _safe_json_loads(evaluation_json, default={})
         overfit_data = _safe_json_loads(overfit_json, default={})
         chart_paths = _safe_json_loads(chart_paths_json, default={})
+        if not chart_paths:
+            chart_paths = _scan_report_charts(Path(os.getenv("REPORTS_DIR", "./reports")))
+        if not chart_paths:
+            try:
+                from tools.viz_tools import generate_all_charts
+                chart_paths = generate_all_charts(df, target_col, os.getenv("REPORTS_DIR", "./reports"))
+                # Re-scan to include any extra charts produced by other tools
+                scanned = _scan_report_charts(Path(os.getenv("REPORTS_DIR", "./reports")))
+                if scanned:
+                    chart_paths = scanned
+            except Exception as e:
+                logger.warning(f"Chart generation skipped: {e}")
 
         best_metrics = automl_data.get("best_metrics") or eval_data.get("metrics") or {}
         all_scores = automl_data.get("all_model_scores", {})
         task_type = automl_data.get("task_type", "unknown")
+
+        # If LLM outputs are missing, compute minimal metrics from the saved model.
+        if not best_metrics:
+            fallback_metrics, fallback_task, fallback_model = _compute_basic_metrics(
+                df, target_col, "./models/best_model.pkl"
+            )
+            if fallback_metrics:
+                best_metrics = fallback_metrics
+            if task_type == "unknown" and fallback_task != "unknown":
+                task_type = fallback_task
+            if automl_data.get("best_model_name") in (None, "N/A", "unknown"):
+                automl_data["best_model_name"] = fallback_model
+
         primary = "accuracy" if task_type == "classification" else "r2"
 
         leaderboard = []
@@ -937,6 +1251,8 @@ def compile_report_data(
             )
 
         top_features = automl_data.get("top_features", [])
+        if not top_features:
+            top_features = _compute_top_features(df, target_col, "./models/best_model.pkl")
         top_feature_names = [f.get("feature", "N/A") for f in top_features[:5] if isinstance(f, dict)]
         top_features_text = ", ".join(top_feature_names) if top_feature_names else "N/A"
 
@@ -1102,6 +1418,24 @@ def compile_report_data(
                 [f"Finding {i+1}: {item}" for i, item in enumerate(key_findings[:3])]
             ) + " Recommended actions: " + "; ".join(recommendations[:3]) + ".",
         }
+
+        llm_enrichment = _llm_enrich_report(report_data)
+        if llm_enrichment:
+            for k, v in llm_enrichment.items():
+                if v not in (None, "", []):
+                    report_data[k] = v
+
+        if not report_data.get("executive_summary"):
+            report_data["executive_summary"] = key_findings[:5]
+        if not report_data.get("insights_bullets"):
+            report_data["insights_bullets"] = key_findings[:4]
+
+        output_dir = Path(os.getenv("REPORTS_DIR", "./reports"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "latest_report_data.json").write_text(
+            json.dumps(report_data, indent=2, default=str),
+            encoding="utf-8",
+        )
 
         logger.success("Report data compiled successfully")
         return json.dumps(report_data, default=str)
