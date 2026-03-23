@@ -36,3 +36,10 @@ If you don't pass a file, the pipeline will run on the Iris demo dataset.
 - **Final report**: LLM generates narrative sections; set `REPORT_USE_LLM=false` to skip LLM enrichment.
 - **Tool-only mode**: Set `FORCE_TOOL_ONLY=true` to run stages without LLM calls.
 - **Fallback**: `FALLBACK_TOOLS_ON_LLM_FAILURE=true` enables tool fallback if LLM calls fail.
+
+## Architecture (High Level)
+- **Orchestrator** coordinates 7 agents end-to-end.
+- **Memory Agent** initializes ChromaDB and stores/retrieves semantic insights.
+- **Ingestion → EDA → Modeling → Evaluation → Reporting** run sequentially.
+- **AutoML pipeline** trains multiple models and selects the best.
+- **Reporting agent** compiles results into HTML/PDF summaries.
