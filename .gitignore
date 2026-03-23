@@ -6,6 +6,7 @@ __pycache__/
 
 # Virtual env + secrets
 .venv/
+.venv310/
 .env
 
 # Generated artifacts
@@ -14,6 +15,7 @@ reports/
 mlruns/
 chroma_db/
 models/
+_crewai_storage/
 
 # OS/editor
 .DS_Store
