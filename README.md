@@ -30,3 +30,9 @@ If you don't pass a file, the pipeline will run on the Iris demo dataset.
 - Vector memory: `./chroma_db`
 - MLflow runs: `./mlruns`
 
+## LLM Usage (Model + Toggles)
+- **Model**: All agents use Groq with `GROQ_MODEL` (default `meta-llama/llama-4-scout-17b-16e-instruct`).
+- **Per-stage LLM**: Each agent is LLM-backed for reasoning and narrative output; core computations are tool-driven (pandas/sklearn/MLflow).
+- **Final report**: LLM generates narrative sections; set `REPORT_USE_LLM=false` to skip LLM enrichment.
+- **Tool-only mode**: Set `FORCE_TOOL_ONLY=true` to run stages without LLM calls.
+- **Fallback**: `FALLBACK_TOOLS_ON_LLM_FAILURE=true` enables tool fallback if LLM calls fail.
